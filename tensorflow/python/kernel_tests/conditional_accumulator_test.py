@@ -20,31 +20,53 @@ from __future__ import print_function
 import time
 
 import numpy as np
-import tensorflow as tf
+
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes as dtypes_lib
+from tensorflow.python.framework import errors_impl
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import data_flow_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import state_ops
+from tensorflow.python.ops import variables
+from tensorflow.python.platform import test
 
 # from functools import reduce
 
 
-class ConditionalAccumulatorTest(tf.test.TestCase):
+class ConditionalAccumulatorTest(test.TestCase):
 
   def testConstructor(self):
-    with tf.Graph().as_default():
-      q = tf.ConditionalAccumulator(tf.float32, name="Q")
-    self.assertTrue(isinstance(q.accumulator_ref, tf.Tensor))
-    self.assertProtoEquals("""
+    with ops.Graph().as_default():
+      q = data_flow_ops.ConditionalAccumulator(dtypes_lib.float32, name="Q")
+    self.assertTrue(isinstance(q.accumulator_ref, ops.Tensor))
+    self.assertProtoEquals(
+        """
       name:'Q' op:'ConditionalAccumulator'
       attr { key: 'dtype' value { type: DT_FLOAT } }
       attr { key: 'shape' value { shape { unknown_rank: true} } }
       attr { key: 'container' value { s: '' } }
       attr { key: 'shared_name' value { s: '' } }
+      attr { key: 'reduction_type' value {s: 'MEAN'} }
       """, q.accumulator_ref.op.node_def)
 
+  def testConstructorWithInvalidArg(self):
+    with ops.Graph().as_default():
+      with self.assertRaises(ValueError):
+        data_flow_ops.ConditionalAccumulator(
+            dtypes_lib.float32, name="Q", reduction_type="Invalid")
+
   def testConstructorWithShape(self):
-    with tf.Graph().as_default():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1, 5, 2, 8]))
-    self.assertTrue(isinstance(q.accumulator_ref, tf.Tensor))
-    self.assertProtoEquals("""
+    with ops.Graph().as_default():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32,
+          name="Q",
+          shape=tensor_shape.TensorShape([1, 5, 2, 8]))
+    self.assertTrue(isinstance(q.accumulator_ref, ops.Tensor))
+    self.assertProtoEquals(
+        """
       name:'Q' op:'ConditionalAccumulator'
       attr { key: 'dtype' value { type: DT_FLOAT } }
       attr { key: 'shape' value { shape { dim {size: 1 }
@@ -54,34 +76,36 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       } } }
       attr { key: 'container' value { s: '' } }
       attr { key: 'shared_name' value { s: '' } }
+      attr { key: 'reduction_type' value {s: 'MEAN'} }
       """, q.accumulator_ref.op.node_def)
 
   def testAccumulatorSizeEmpty(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(tf.float32, name="Q")
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(dtypes_lib.float32, name="Q")
       self.assertEqual(q.num_accumulated().eval(), 0)
 
   def testAccumulatorSetGlobalStep(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       set_global_step_op = q.set_global_step(1)
       set_global_step_op.run()
 
   def testAccumulatorApplyGradFloat32(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       accum_op = q.apply_grad((10.0,))
       accum_op.run()
 
   def testDtypes(self):
-    with self.test_session() as sess:
-      dtypes = [tf.float16, tf.float32, tf.float64]
+    with self.cached_session() as sess:
+      dtypes = [dtypes_lib.float16, dtypes_lib.float32, dtypes_lib.float64]
 
       for i in range(len(dtypes)):
         dtype = dtypes[i]
-        q = tf.ConditionalAccumulator(dtype, shape=tf.TensorShape([1]))
+        q = data_flow_ops.ConditionalAccumulator(
+            dtype, shape=tensor_shape.TensorShape([1]))
 
         elems = np.arange(10).astype(dtype.as_numpy_dtype)
         for e in elems:
@@ -92,15 +116,15 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
         self.assertEqual(sum(elems) / len(elems), result)
 
   def testAccumulatorMultipleAccumulators(self):
-    with self.test_session():
-      q_f32_0 = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
-      q_f32_1 = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
-      q_f16_0 = tf.ConditionalAccumulator(
-          tf.float16, name="Q", shape=tf.TensorShape([1]))
-      q_f16_1 = tf.ConditionalAccumulator(
-          tf.float16, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q_f32_0 = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
+      q_f32_1 = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
+      q_f16_0 = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float16, name="Q", shape=tensor_shape.TensorShape([1]))
+      q_f16_1 = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float16, name="Q", shape=tensor_shape.TensorShape([1]))
 
       accums = [q_f16_0, q_f16_1, q_f32_0, q_f32_1]
       for i in range(len(accums)):
@@ -111,8 +135,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
         self.assertEqual(result, i + 10.0)
 
   def testAccumulatorApplyAndTakeGradWithShape(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(tf.float32, name="Q", shape=(3, 2))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=(3, 2))
       elems = [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
                [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]]
       elems_ave = [[(a + b) / len(elems) for a, b in zip(x, y)]
@@ -131,7 +156,8 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       self.assertTrue(is_all_equal)
 
   def testAccumulatorApplyGradWithWrongShape(self):
-    q = tf.ConditionalAccumulator(tf.float32, name="Q", shape=(3, 2))
+    q = data_flow_ops.ConditionalAccumulator(
+        dtypes_lib.float32, name="Q", shape=(3, 2))
 
     with self.assertRaises(ValueError):
       q.apply_grad([[1.0, 2.0], [3.0, 4.0]])
@@ -140,10 +166,11 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       q.apply_grad([[1.0], [2.0], [3.0]])
 
   def testAccumulatorDynamicShape(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(tf.float32, name="Q", shape=None)
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=None)
 
-      x = tf.placeholder(tf.float32)
+      x = array_ops.placeholder(dtypes_lib.float32)
 
       accum_op = q.apply_grad(x)
 
@@ -164,26 +191,27 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       self.assertTrue(is_all_equal)
 
   def testAccumulatorWrongDynamicShape(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(tf.float32, name="Q", shape=None)
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=None)
 
-      x = tf.placeholder(tf.float32)
+      x = array_ops.placeholder(dtypes_lib.float32)
 
       accum_op = q.apply_grad(x)
 
       # First successful apply_grad determines shape
       sess.run(accum_op, feed_dict={x: [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]})
 
-      with self.assertRaises(tf.errors.InvalidArgumentError):
+      with self.assertRaises(errors_impl.InvalidArgumentError):
         sess.run(accum_op, feed_dict={x: [[1.0, 2.0], [3.0, 4.0]]})
 
-      with self.assertRaises(tf.errors.InvalidArgumentError):
+      with self.assertRaises(errors_impl.InvalidArgumentError):
         sess.run(accum_op, feed_dict={x: [[1.0], [2.0], [3.0]]})
 
   def testAccumulatorSizeAfterApplyGrad(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       accum_op = q.apply_grad((10.0,))
       self.assertEqual(q.num_accumulated().eval(), 0)
       accum_op.run()
@@ -192,9 +220,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       self.assertEqual(q.num_accumulated().eval(), 2)
 
   def testAccumulatorSizeAfterApplyGradAndTakeGrad(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       accum_op = q.apply_grad((10.0,))
       extract_t = q.take_grad(2)
 
@@ -219,12 +247,11 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       extract_t.op.run()
       self.assertEqual(q.num_accumulated().eval(), 0)
 
-  def testAccumulatorTakeGrad(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+  def testAccumulatorTakeGradMean(self):
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       elems = [10.0, 20.0]
-      elems_ave = sum(elems) / len(elems)
 
       accum_ops = [q.apply_grad((x,), local_step=0) for x in elems]
       takeg_t = q.take_grad(1)
@@ -233,21 +260,56 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
         accum_op.run()
 
       val = takeg_t.eval()
-      self.assertEqual(elems_ave, val)
+      self.assertEqual(15.0, val)
 
       accum_ops = [q.apply_grad((x,), local_step=1) for x in elems]
-      takeg_t = q.take_grad(tf.constant(1))
+      takeg_t = q.take_grad(constant_op.constant(1))
 
       for accum_op in accum_ops:
         accum_op.run()
 
       val = takeg_t.eval()
-      self.assertEqual(elems_ave, val)
+      self.assertEqual(15.0, val)
+
+  def testAccumulatorTakeGradSum(self):
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32,
+          name="Q",
+          shape=tensor_shape.TensorShape([1]),
+          reduction_type="SUM")
+      elems = [10.0, 20.0]
+
+      accum_ops = [q.apply_grad((x,), local_step=0) for x in elems]
+      takeg_t = q.take_grad(1)
+
+      for accum_op in accum_ops:
+        accum_op.run()
+
+      val = takeg_t.eval()
+      self.assertEqual(30.0, val)
+
+      accum_ops = [q.apply_grad((x,), local_step=1) for x in elems]
+      takeg_t = q.take_grad(constant_op.constant(1))
+
+      for accum_op in accum_ops:
+        accum_op.run()
+
+      val = takeg_t.eval()
+      self.assertEqual(30.0, val)
+
+  def testAccumulatorTakeGradInvalidReductionType(self):
+    with self.assertRaises(ValueError):
+      data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32,
+          name="Q",
+          shape=tensor_shape.TensorShape([1]),
+          reduction_type="Invalid")
 
   def testAccumulatorInvalidTakeGrad(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       elems = [10.0, 20.0]
       accum_ops = [q.apply_grad((x,)) for x in elems]
 
@@ -256,13 +318,13 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       for accum_op in accum_ops:
         accum_op.run()
 
-      with self.assertRaises(tf.errors.InvalidArgumentError):
+      with self.assertRaises(errors_impl.InvalidArgumentError):
         takeg_t.eval()
 
-  def testAccumulatorRepeatedTakeGrad(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+  def testAccumulatorRepeatedTakeGradMean(self):
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
 
       elems = [10.0, 20.0]
       elems_ave = sum(elems) / len(elems)
@@ -286,26 +348,56 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       val = takeg_t.eval()
       self.assertEqual(elems_ave + 0.0, val)
 
-  def testAccumulatorIncrementGlobalStep(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+  def testAccumulatorRepeatedTakeGradSum(self):
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32,
+          name="Q",
+          shape=tensor_shape.TensorShape([1]),
+          reduction_type="SUM")
 
-      global_step = tf.Variable(0, name="global_step")
-      new_global_step = tf.add(global_step, 1)
-      inc_global_step = tf.assign(global_step, new_global_step)
+      elems = [10.0, 20.0]
+      elems_sum = 30.0
+      accum_ops = [q.apply_grad((x,), local_step=0) for x in elems]
+      takeg_t = q.take_grad(1)
+
+      for accum_op in accum_ops:
+        accum_op.run()
+
+      val = takeg_t.eval()
+      self.assertEqual(elems_sum, val)
+
+      elems = [20.0, 30.0]
+      elems_sum = 50.0
+      accum_ops = [q.apply_grad((x,), local_step=1) for x in elems]
+      takeg_t = q.take_grad(1)
+
+      for accum_op in accum_ops:
+        accum_op.run()
+
+      val = takeg_t.eval()
+      self.assertEqual(elems_sum, val)
+
+  def testAccumulatorIncrementGlobalStep(self):
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
+
+      global_step = variables.Variable(0, name="global_step")
+      new_global_step = math_ops.add(global_step, 1)
+      inc_global_step = state_ops.assign(global_step, new_global_step)
 
       set_global_step_op = q.set_global_step(new_global_step)
 
-      tf.global_variables_initializer().run()
+      variables.global_variables_initializer().run()
       for _ in range(3):
         set_global_step_op.run()
         inc_global_step.eval()
 
   def testAccumulatorSetGlobalStepPreventsAccumulation(self):
-    with self.test_session():
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session():
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
 
       local_steps = range(1000, 1005)
       accum_ops = [q.apply_grad((0.0 + x,), local_step=x) for x in local_steps]
@@ -324,9 +416,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
                                                      if x >= ls), val)
 
   def testParallelApplyGrad(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       elems = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
       accum_ops = [q.apply_grad((x,), local_step=0) for x in elems]
       takeg_t = q.take_grad(1)
@@ -334,8 +426,10 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       def apply_grad(accum_op):
         sess.run(accum_op)
 
-      threads = [self.checkedThread(
-          target=apply_grad, args=(o,)) for o in accum_ops]
+      threads = [
+          self.checkedThread(
+              target=apply_grad, args=(o,)) for o in accum_ops
+      ]
 
       for thread in threads:
         thread.start()
@@ -347,9 +441,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       self.assertEqual(val, sum(elems) / len(elems))
 
   def testParallelTakeGrad(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       elems = [e for e in range(10)]
       accum_ops = [q.apply_grad((np.float32(e),), local_step=e) for e in elems]
       takeg_t = q.take_grad(1)
@@ -379,9 +473,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       self.assertItemsEqual(elems, results)
 
   def testAccumulatorApplyAndBlockingTake(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
 
       elems = [10.0, 20.0, 30.0]
       elems_ave = sum(elems) / len(elems)
@@ -412,9 +506,9 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
       sess.run(takeg_op)
 
   def testAccumulatorCancel(self):
-    with self.test_session() as sess:
-      q = tf.ConditionalAccumulator(
-          tf.float32, name="Q", shape=tf.TensorShape([1]))
+    with self.cached_session() as sess:
+      q = data_flow_ops.ConditionalAccumulator(
+          dtypes_lib.float32, name="Q", shape=tensor_shape.TensorShape([1]))
       takeg_t = q.take_grad(1)
 
       takeg_thread = self.checkedThread(
@@ -428,5 +522,6 @@ class ConditionalAccumulatorTest(tf.test.TestCase):
 
       takeg_thread.join()
 
+
 if __name__ == "__main__":
-  tf.test.main()
+  test.main()

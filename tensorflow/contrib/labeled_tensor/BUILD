@@ -7,6 +7,8 @@ exports_files(["LICENSE"])
 
 package(default_visibility = ["//tensorflow:__subpackages__"])
 
+load("//tensorflow:tensorflow.bzl", "py_test")
+
 py_library(
     name = "labeled_tensor",
     srcs = ["__init__.py"],
@@ -20,11 +22,21 @@ py_library(
     ],
 )
 
+# Transitive dependencies of this target will be included in the pip package.
+py_library(
+    name = "labeled_tensor_pip",
+    deps = [
+        ":labeled_tensor",
+        ":test_util",
+    ],
+)
+
 py_library(
     name = "_typecheck",
     srcs = ["python/ops/_typecheck.py"],
     srcs_version = "PY2AND3",
     visibility = [":__subpackages__"],
+    deps = ["//tensorflow/python:util"],
 )
 
 py_library(
@@ -33,6 +45,11 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":_typecheck",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:math_ops",
+        "//third_party/py/numpy",
+        "@six_archive//:six",
     ],
 )
 
@@ -41,9 +58,8 @@ py_library(
     srcs = ["python/ops/test_util.py"],
     srcs_version = "PY2AND3",
     deps = [
-        ":_typecheck",
-        ":core",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:training",
     ],
 )
 
@@ -54,10 +70,16 @@ py_test(
         "python/ops/core_test.py",
     ],
     srcs_version = "PY2AND3",
+    tags = ["no_windows"],  # TODO: needs investigation on Windows
     deps = [
+        ":_typecheck",
         ":core",
         ":test_util",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:math_ops",
+        "//third_party/py/numpy",
     ],
 )
 
@@ -66,7 +88,12 @@ py_library(
     srcs = ["python/ops/io_ops.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":_typecheck",
         ":core",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:parsing_ops",
+        "@six_archive//:six",
     ],
 )
 
@@ -78,10 +105,14 @@ py_test(
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":core",
         ":io_ops",
-        ":ops",
         ":test_util",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/core:protos_all_py",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:session",
     ],
 )
 
@@ -91,6 +122,8 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":core",
+        "//tensorflow/contrib/nn:nn_py",
+        "//tensorflow/python:nn",
     ],
 )
 
@@ -102,9 +135,11 @@ py_test(
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":core",
         ":nn",
         ":test_util",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:nn",
+        "//tensorflow/python:nn_ops",
     ],
 )
 
@@ -113,7 +148,17 @@ py_library(
     srcs = ["python/ops/ops.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":_typecheck",
         ":core",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:functional_ops",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:numerics",
+        "//tensorflow/python:random_ops",
+        "//tensorflow/python:training",
+        "//third_party/py/numpy",
+        "@six_archive//:six",
     ],
 )
 
@@ -125,9 +170,16 @@ py_test(
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":core",
         ":ops",
         ":test_util",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:errors",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:math_ops",
+        "//tensorflow/python:string_ops",
+        "//third_party/py/numpy",
     ],
 )
 
@@ -136,8 +188,11 @@ py_library(
     srcs = ["python/ops/sugar.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":_typecheck",
         ":core",
         ":ops",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "@six_archive//:six",
     ],
 )
 
@@ -149,19 +204,13 @@ py_test(
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":core",
+        ":ops",
         ":sugar",
         ":test_util",
-        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:array_ops",
+        "//tensorflow/python:client_testlib",
+        "//tensorflow/python:framework_for_generated_wrappers",
+        "//tensorflow/python:math_ops",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
 )

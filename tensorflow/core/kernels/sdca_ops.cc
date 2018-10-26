@@ -38,6 +38,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/hinge-loss.h"
 #include "tensorflow/core/kernels/logistic-loss.h"
 #include "tensorflow/core/kernels/loss.h"
+#include "tensorflow/core/kernels/poisson-loss.h"
 #include "tensorflow/core/kernels/sdca_internal.h"
 #include "tensorflow/core/kernels/smooth-hinge-loss.h"
 #include "tensorflow/core/kernels/squared-loss.h"
@@ -57,14 +58,14 @@ namespace tensorflow {
 
 namespace {
 
-using sdca::Regularizations;
 using sdca::Example;
 using sdca::Examples;
 using sdca::ExampleStatistics;
 using sdca::ModelWeights;
+using sdca::Regularizations;
 
 struct ComputeOptions {
-  ComputeOptions(OpKernelConstruction* const context) {
+  explicit ComputeOptions(OpKernelConstruction* const context) {
     string loss_type;
     OP_REQUIRES_OK(context, context->GetAttr("loss_type", &loss_type));
     if (loss_type == "logistic_loss") {
@@ -75,11 +76,18 @@ struct ComputeOptions {
       loss_updater.reset(new HingeLossUpdater);
     } else if (loss_type == "smooth_hinge_loss") {
       loss_updater.reset(new SmoothHingeLossUpdater);
+    } else if (loss_type == "poisson_loss") {
+      loss_updater.reset(new PoissonLossUpdater);
     } else {
-      OP_REQUIRES(context, false, errors::InvalidArgument(
-                                      "Unsupported loss type: ", loss_type));
+      OP_REQUIRES(
+          context, false,
+          errors::InvalidArgument("Unsupported loss type: ", loss_type));
     }
-    OP_REQUIRES_OK(context, context->GetAttr("adaptative", &adaptative));
+    auto s = context->GetAttr("adaptative", &adaptive);
+    if (!s.ok()) {
+      s = context->GetAttr("adaptive", &adaptive);
+    }
+    OP_REQUIRES_OK(context, s);
     OP_REQUIRES_OK(
         context, context->GetAttr("num_sparse_features", &num_sparse_features));
     OP_REQUIRES_OK(context, context->GetAttr("num_sparse_features_with_values",
@@ -90,9 +98,10 @@ struct ComputeOptions {
         context, num_sparse_features + num_dense_features > 0,
         errors::InvalidArgument("Requires at least one feature to train."));
 
-    OP_REQUIRES(context, static_cast<int64>(num_sparse_features) +
-                                 static_cast<int64>(num_dense_features) <=
-                             std::numeric_limits<int>::max(),
+    OP_REQUIRES(context,
+                static_cast<int64>(num_sparse_features) +
+                        static_cast<int64>(num_dense_features) <=
+                    std::numeric_limits<int>::max(),
                 errors::InvalidArgument(
                     strings::Printf("Too many feature groups: %lld > %d",
                                     static_cast<int64>(num_sparse_features) +
@@ -111,7 +120,7 @@ struct ComputeOptions {
   int num_dense_features = 0;
   int num_inner_iterations = 0;
   int num_loss_partitions = 0;
-  bool adaptative = false;
+  bool adaptive = true;
   Regularizations regularizations;
 };
 
@@ -142,25 +151,28 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
 
   Tensor mutable_example_state_data_t(*example_state_data_t);
   auto example_state_data = mutable_example_state_data_t.matrix<float>();
-  context->set_output("out_example_state_data", mutable_example_state_data_t);
+  OP_REQUIRES_OK(context, context->set_output("out_example_state_data",
+                                              mutable_example_state_data_t));
 
-  if (options.adaptative) {
+  if (options.adaptive) {
     OP_REQUIRES_OK(context,
-                   examples.SampleAdaptativeProbabilities(
+                   examples.SampleAdaptiveProbabilities(
                        options.num_loss_partitions, options.regularizations,
                        model_weights, example_state_data, options.loss_updater,
                        /*num_weight_vectors =*/1));
+  } else {
+    examples.RandomShuffle();
   }
-
-  mutex mu;
-  Status train_step_status GUARDED_BY(mu);
+  struct {
+    mutex mu;
+    Status value GUARDED_BY(mu);
+  } train_step_status;
   std::atomic<std::int64_t> atomic_index(-1);
   auto train_step = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
-      const int64 example_index =
-          examples.sampled_index(++atomic_index, options.adaptative);
+      const int64 example_index = examples.sampled_index(++atomic_index);
       const Example& example = examples.example(example_index);
       const float dual = example_state_data(example_index, 0);
       const float example_weight = example.example_weight();
@@ -168,8 +180,8 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
       const Status conversion_status =
           options.loss_updater->ConvertLabel(&example_label);
       if (!conversion_status.ok()) {
-        mutex_lock l(mu);
-        train_step_status = conversion_status;
+        mutex_lock l(train_step_status.mu);
+        train_step_status.value = conversion_status;
         // Return from this worker thread - the calling thread is
         // responsible for checking context status and returning on error.
         return;
@@ -214,7 +226,8 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
 
   Shard(worker_threads.num_threads, worker_threads.workers,
         examples.num_examples(), kCostPerUnit, train_step);
-  OP_REQUIRES_OK(context, train_step_status);
+  mutex_lock l(train_step_status.mu);
+  OP_REQUIRES_OK(context, train_step_status.value);
 }
 
 }  // namespace
@@ -224,7 +237,7 @@ class SdcaOptimizer : public OpKernel {
   explicit SdcaOptimizer(OpKernelConstruction* const context)
       : OpKernel(context), options_(context) {}
 
-  void Compute(OpKernelContext* const context) override {
+  void Compute(OpKernelContext* context) override {
     DoCompute(options_, context);
   }
 
@@ -236,6 +249,8 @@ class SdcaOptimizer : public OpKernel {
 };
 REGISTER_KERNEL_BUILDER(Name("SdcaOptimizer").Device(DEVICE_CPU),
                         SdcaOptimizer);
+REGISTER_KERNEL_BUILDER(Name("SdcaOptimizerV2").Device(DEVICE_CPU),
+                        SdcaOptimizer);
 
 class SdcaShrinkL1 : public OpKernel {
  public:
@@ -244,7 +259,7 @@ class SdcaShrinkL1 : public OpKernel {
     OP_REQUIRES_OK(context, regularizations_.Initialize(context));
   }
 
-  void Compute(OpKernelContext* const context) override {
+  void Compute(OpKernelContext* context) override {
     OpMutableInputList weights_inputs;
     OP_REQUIRES_OK(context,
                    context->mutable_input_list("weights", &weights_inputs));
@@ -287,7 +302,7 @@ class SdcaFprint : public OpKernel {
   explicit SdcaFprint(OpKernelConstruction* const context)
       : OpKernel(context) {}
 
-  void Compute(OpKernelContext* const context) override {
+  void Compute(OpKernelContext* context) override {
     const Tensor& input = context->input(0);
     OP_REQUIRES(context, TensorShapeUtils::IsVector(input.shape()),
                 errors::InvalidArgument("Input must be a vector, got shape ",

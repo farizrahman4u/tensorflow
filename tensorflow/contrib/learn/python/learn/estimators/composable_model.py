@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""TensorFlow composable models used as building blocks for estimators (deprecated).
 
-"""TensorFlow composable models used as building blocks for estimators."""
+This module and all its submodules are deprecated. See
+[contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+for migration instructions.
+"""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -28,13 +32,14 @@ from tensorflow.contrib import layers
 from tensorflow.contrib.framework import list_variables
 from tensorflow.contrib.framework import load_variable
 from tensorflow.contrib.layers.python.layers import feature_column_ops
-from tensorflow.python import summary
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import clip_ops
 from tensorflow.python.ops import gradients
 from tensorflow.python.ops import nn
 from tensorflow.python.ops import partitioned_variables
 from tensorflow.python.ops import variable_scope
+from tensorflow.python.summary import summary
+from tensorflow.python.util.deprecation import deprecated
 
 
 class _ComposableModel(object):
@@ -47,6 +52,7 @@ class _ComposableModel(object):
   _ComposableModel and its subclasses are not part of the public tf.learn API.
   """
 
+  @deprecated(None, "Please use model_fns in tf.estimator.")
   def __init__(self,
                num_label_columns,
                optimizer,
@@ -142,6 +148,10 @@ class _ComposableModel(object):
 class LinearComposableModel(_ComposableModel):
   """A _ComposableModel that implements linear regression.
 
+  THIS CLASS IS DEPRECATED. See
+  [contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+  for general migration instructions.
+
   Instances of this class can be used to build estimators through the use
   of composition.
   """
@@ -213,17 +223,15 @@ class LinearComposableModel(_ComposableModel):
     Returns:
       The bias weights created by this model.
     """
-    return load_variable(model_dir, name=(self._scope+"/bias_weight"))
+    return load_variable(model_dir, name=(self._scope + "/bias_weight"))
 
   def build_model(self, features, feature_columns, is_training):
     """See base class."""
     self._feature_columns = feature_columns
     partitioner = partitioned_variables.min_max_variable_partitioner(
-        max_partitions=self._num_ps_replicas,
-        min_slice_size=64 << 20)
+        max_partitions=self._num_ps_replicas, min_slice_size=64 << 20)
     with variable_scope.variable_scope(
-        self._scope,
-        values=features.values(),
+        self._scope, values=features.values(),
         partitioner=partitioner) as scope:
       if self._joint_weights:
         logits, _, _ = layers.joint_weighted_sum_from_feature_columns(
@@ -254,6 +262,10 @@ class LinearComposableModel(_ComposableModel):
 
 class DNNComposableModel(_ComposableModel):
   """A _ComposableModel that implements a DNN.
+
+  THIS CLASS IS DEPRECATED. See
+  [contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+  for general migration instructions.
 
   Instances of this class can be used to build estimators through the use
   of composition.
@@ -314,9 +326,10 @@ class DNNComposableModel(_ComposableModel):
     """
     return [
         load_variable(
-            model_dir, name=(self._scope+"/hiddenlayer_%d/weights" % i))
+            model_dir, name=(self._scope + "/hiddenlayer_%d/weights" % i))
         for i, _ in enumerate(self._hidden_units)
-    ] + [load_variable(model_dir, name=(self._scope+"/logits/weights"))]
+    ] + [load_variable(
+        model_dir, name=(self._scope + "/logits/weights"))]
 
   def get_bias(self, model_dir):
     """Returns the bias of the model.
@@ -329,14 +342,15 @@ class DNNComposableModel(_ComposableModel):
     """
     return [
         load_variable(
-            model_dir, name=(self._scope+"/hiddenlayer_%d/biases" % i))
+            model_dir, name=(self._scope + "/hiddenlayer_%d/biases" % i))
         for i, _ in enumerate(self._hidden_units)
-    ] + [load_variable(model_dir, name=(self._scope+"/logits/biases"))]
+    ] + [load_variable(
+        model_dir, name=(self._scope + "/logits/biases"))]
 
   def _add_hidden_layer_summary(self, value, tag):
     # TODO(zakaria): Move this code to tf.learn and add test.
-    summary.scalar("%s:fraction_of_zero_values" % tag, nn.zero_fraction(value))
-    summary.histogram("%s:activation" % tag, value)
+    summary.scalar("%s/fraction_of_zero_values" % tag, nn.zero_fraction(value))
+    summary.histogram("%s/activation" % tag, value)
 
   def build_model(self, features, feature_columns, is_training):
     """See base class."""
@@ -344,8 +358,7 @@ class DNNComposableModel(_ComposableModel):
 
     input_layer_partitioner = (
         partitioned_variables.min_max_variable_partitioner(
-            max_partitions=self._num_ps_replicas,
-            min_slice_size=64 << 20))
+            max_partitions=self._num_ps_replicas, min_slice_size=64 << 20))
     with variable_scope.variable_scope(
         self._scope + "/input_from_feature_columns",
         values=features.values(),
@@ -373,9 +386,7 @@ class DNNComposableModel(_ComposableModel):
             trainable=self._trainable,
             scope=scope)
         if self._dropout is not None and is_training:
-          net = layers.dropout(
-              net,
-              keep_prob=(1.0 - self._dropout))
+          net = layers.dropout(net, keep_prob=(1.0 - self._dropout))
       self._add_hidden_layer_summary(net, scope.name)
 
     with variable_scope.variable_scope(

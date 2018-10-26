@@ -24,25 +24,24 @@ limitations under the License.
 #else
 #include <unistd.h>
 #endif
+#include "absl/strings/str_cat.h"
 #include "tensorflow/stream_executor/cuda/cuda_diagnostics.h"
 #include "tensorflow/stream_executor/cuda/cuda_driver.h"
 #include "tensorflow/stream_executor/cuda/cuda_event.h"
 #include "tensorflow/stream_executor/cuda/cuda_platform_id.h"
 #include "tensorflow/stream_executor/cuda/cuda_stream.h"
 #include "tensorflow/stream_executor/cuda/cuda_timer.h"
-#include "tensorflow/stream_executor/dso_loader.h"
 #include "tensorflow/stream_executor/kernel_cache_config.h"
-#include "tensorflow/stream_executor/lib/casts.h"
 #include "tensorflow/stream_executor/lib/env.h"
 #include "tensorflow/stream_executor/lib/error.h"
 #include "tensorflow/stream_executor/lib/initialize.h"
 #include "tensorflow/stream_executor/lib/mathutil.h"
+#include "tensorflow/stream_executor/lib/numbers.h"
 #include "tensorflow/stream_executor/lib/path.h"
 #include "tensorflow/stream_executor/lib/process_state.h"
 #include "tensorflow/stream_executor/lib/ptr_util.h"
 #include "tensorflow/stream_executor/lib/statusor.h"
 #include "tensorflow/stream_executor/lib/str_util.h"
-#include "tensorflow/stream_executor/lib/strcat.h"
 #include "tensorflow/stream_executor/lib/stringprintf.h"
 #include "tensorflow/stream_executor/platform.h"
 #include "tensorflow/stream_executor/platform/logging.h"
@@ -52,7 +51,6 @@ limitations under the License.
 #include "tensorflow/stream_executor/stream_executor_internal.h"
 #include "tensorflow/stream_executor/stream_executor_pimpl.h"
 #include "tensorflow/stream_executor/timer.h"
-#include "tensorflow/stream_executor/lib/numbers.h"
 
 #ifdef PLATFORMS_GPUS_CUDA_DYNAMIC_LIBCUDA_DYNAMIC_LIBCUDA_H_
 #error \
@@ -65,19 +63,9 @@ limitations under the License.
 #endif
 
 extern bool FLAGS_check_gpu_leaks;
-tensorflow::int32 FLAGS_register_occupancy_warning_threshold;
 bool FLAGS_prefer_cubin_to_ptx = true;
 
-namespace perftools {
-namespace gputools {
-namespace rng {
-class RngSupport;
-}  // namespace rng
-}  // namespace gputools
-}  // namespace perftools
-
-namespace perftools {
-namespace gputools {
+namespace stream_executor {
 namespace cuda {
 
 // Hook that can be used to CUBIN-ate PTX before it is loaded into the driver.
@@ -118,11 +106,6 @@ static CUdeviceptr AsCudaDevicePtr(DeviceMemoryBase *gpu_mem) {
   return AsCudaDevicePtr(*gpu_mem);
 }
 
-static CudaContext* GetCudaContext(Stream *stream) {
-  return static_cast<CUDAExecutor *>(stream->parent()->implementation())
-      ->cuda_context();
-}
-
 CudaContext* ExtractCudaContext(CUDAExecutor *cuda_exec) {
   CHECK(cuda_exec != nullptr);
   return cuda_exec->cuda_context();
@@ -133,12 +116,8 @@ CUDAExecutor *ExtractCudaExecutor(StreamExecutor *stream_exec) {
 }
 
 CUDAExecutor::~CUDAExecutor() {
-  for (auto &it : disk_modules_) {
-    CUDADriver::UnloadModule(context_, it.second);
-  }
-  for (auto &it : in_memory_modules_) {
-    CUDADriver::UnloadModule(context_, it.second);
-  }
+  CHECK(kernel_to_gpu_binary_.empty()) << "CUDAExecutor has live kernels.";
+  CHECK(gpu_binary_to_module_.empty()) << "CUDAExecutor has loaded modules.";
   if (context_ != nullptr) {
     CUDADriver::DestroyContext(context_);
   }
@@ -173,10 +152,8 @@ bool CUDAExecutor::FindOnDiskForComputeCapability(
     return false;
   }
 
-  // TODO(22689637): Eliminate unnecessary ToString()s when all dependencies
-  // have been migrated.
-  string cc_specific = port::StrCat(filename.ToString(), ".cc", cc_major_,
-                                    cc_minor_, canonical_suffix.ToString());
+  string cc_specific =
+      absl::StrCat(filename, ".cc", cc_major_, cc_minor_, canonical_suffix);
   if (port::FileExists(cc_specific).ok()) {
     VLOG(2) << "found compute-capability-specific file, using that: "
             << cc_specific;
@@ -186,8 +163,8 @@ bool CUDAExecutor::FindOnDiskForComputeCapability(
 
   VLOG(2) << "could not find compute-capability specific file at: "
           << cc_specific;
-  if (port::FileExists(filename.ToString()).ok()) {
-    *found_filename = filename.ToString();
+  if (port::FileExists(string(filename)).ok()) {
+    *found_filename = string(filename);
     return true;
   }
 
@@ -202,11 +179,11 @@ bool CUDAExecutor::FindOnDiskForComputeCapability(
 static string GetBinaryDir(bool strip_exe) {
   char exe_path[PATH_MAX] = {0};
 #if defined(__APPLE__)
-    uint32_t buffer_size = 0U;
-    _NSGetExecutablePath(nullptr, &buffer_size);
-    char unresolved_path[buffer_size];
-    _NSGetExecutablePath(unresolved_path, &buffer_size);
-    CHECK_ERR(realpath(unresolved_path, exe_path) ? 1 : -1);
+  uint32_t buffer_size = 0U;
+  _NSGetExecutablePath(nullptr, &buffer_size);
+  char unresolved_path[buffer_size];
+  _NSGetExecutablePath(unresolved_path, &buffer_size);
+  CHECK_ERR(realpath(unresolved_path, exe_path) ? 1 : -1);
 #else
 #if defined(PLATFORM_WINDOWS)
   HMODULE hModule = GetModuleHandle(NULL);
@@ -228,24 +205,64 @@ static string GetBinaryDir(bool strip_exe) {
   return exe_path;
 }
 
+bool CUDAExecutor::LoadModuleFromCuBin(const char *cubin, CUmodule *module) {
+  uint64_t module_refcount;
+  std::tie(*module, module_refcount) = gpu_binary_to_module_[cubin];
+
+  if (*module == nullptr) {
+    auto load_status = CUDADriver::LoadCubin(context_, cubin, module);
+    if (!load_status.ok()) {
+      LOG(ERROR) << "failed to load CUBIN: " << load_status;
+      return false;
+    }
+    module_refcount = 1;
+    VLOG(3) << "Loaded CUBIN " << static_cast<const void *>(cubin)
+            << " as module " << *module;
+  } else {
+    ++module_refcount;
+    VLOG(3) << "CUBIN " << static_cast<const void *>(cubin)
+            << " is already loaded as module " << *module;
+  }
+  gpu_binary_to_module_[cubin] = {*module, module_refcount};
+  return true;
+}
+
+bool CUDAExecutor::LoadModuleFromPtx(const char *ptx, CUmodule *module) {
+  uint64_t module_refcount;
+  std::tie(*module, module_refcount) = gpu_binary_to_module_[ptx];
+
+  if (*module == nullptr) {
+    if (!CUDADriver::LoadPtx(context_, ptx, module)) {
+      return false;
+    }
+    VLOG(3) << "Loaded PTX " << static_cast<const void *>(ptx) << " as module "
+            << *module;
+    module_refcount = 1;
+  } else {
+    ++module_refcount;
+    VLOG(3) << "PTX " << static_cast<const void *>(ptx)
+            << " is already loaded as module " << module;
+  }
+  gpu_binary_to_module_[ptx] = {*module, module_refcount};
+  return true;
+}
+
 bool CUDAExecutor::GetKernel(const MultiKernelLoaderSpec &spec,
                              KernelBase *kernel) {
   CUDAKernel *cuda_kernel = AsCUDAKernel(kernel);
-  CUmodule module = nullptr;
+  CUmodule module;
   const string *kernelname;
 
-  const OnDiskKernelLoaderSpec *on_disk_spec = nullptr;
-  bool has_ptx = spec.has_cuda_ptx_on_disk();
-  bool has_cubin = spec.has_cuda_cubin_on_disk();
-  if (has_cubin && (!has_ptx || FLAGS_prefer_cubin_to_ptx)) {
-    on_disk_spec = &spec.cuda_cubin_on_disk();
-  } else if (has_ptx) {
-    on_disk_spec = &spec.cuda_ptx_on_disk();
-  }
+  VLOG(3) << "GetKernel on kernel " << kernel << " : " << kernel->name();
 
-  if (on_disk_spec != nullptr) {
-    LOG(WARNING) << "loading CUDA kernel from disk is not supported";
-    return false;
+  if (spec.has_cuda_cubin_in_memory()) {
+    mutex_lock lock{in_memory_modules_mu_};
+    kernelname = &spec.cuda_cubin_in_memory().kernelname();
+    const char *cubin = spec.cuda_cubin_in_memory().bytes();
+    if (!LoadModuleFromCuBin(cubin, &module)) {
+      return false;
+    }
+    kernel_to_gpu_binary_[kernel] = cubin;
   } else if (spec.has_cuda_ptx_in_memory()) {
     kernelname = &spec.cuda_ptx_in_memory().kernelname();
 
@@ -253,62 +270,25 @@ bool CUDAExecutor::GetKernel(const MultiKernelLoaderSpec &spec,
       return false;
     }
 
-    // Note that the orignal ptx may be compressed, and the ptx we get below is
-    // the decompressed result. To cache the module we should use the original
-    // ptx (compressed one) as the key. This is because for the same compressed
-    // ptx, we may get different decompressed ptx wrt the pointer value.
     const char *ptx = spec.cuda_ptx_in_memory().text(cc_major_, cc_minor_);
-    const char *orig_ptx =
-        spec.cuda_ptx_in_memory().original_text(cc_major_, cc_minor_);
-    if (ptx == nullptr || orig_ptx == nullptr) {
+    if (ptx == nullptr) {
       ptx = spec.cuda_ptx_in_memory().default_text();
-      orig_ptx = spec.cuda_ptx_in_memory().original_default_text();
     }
-    if (ptx == nullptr || orig_ptx == nullptr) {
-      LOG(FATAL) << "could not load ptx for kernel " << kernelname;
+    if (ptx == nullptr) {
+      LOG(FATAL) << "loader spec has no ptx for kernel " << *kernelname;
       return false;
     }
 
     mutex_lock lock{in_memory_modules_mu_};
-    module = in_memory_modules_[orig_ptx];
-
-    if (module == nullptr) {
-      if (g_cubinate == nullptr) {
-        if (!CUDADriver::LoadPtx(context_, ptx, &module)) {
-          return false;
-        }
-      } else {
-        string cubin = g_cubinate(ptx);
-        auto load_status =
-            CUDADriver::LoadCubin(context_, cubin.c_str(), &module);
-        if (!load_status.ok()) {
-          LOG(ERROR) << "failed to load cubin via hook: " << load_status;
-          return false;
-        }
-      }
-      in_memory_modules_[orig_ptx] = module;
+    if (!LoadModuleFromPtx(ptx, &module)) {
+      return false;
     }
-  } else if (spec.has_cuda_cubin_in_memory()) {
-    kernelname = &spec.cuda_cubin_in_memory().kernelname();
-    const char *cubin = spec.cuda_cubin_in_memory().bytes();
-    mutex_lock lock{in_memory_modules_mu_};
-    module = in_memory_modules_[cubin];
-
-    if (module == nullptr) {
-      auto load_status = CUDADriver::LoadCubin(context_, cubin, &module);
-      if (!load_status.ok()) {
-        LOG(ERROR) << "failed to load CUBIN: " << load_status;
-        return false;
-      }
-
-      in_memory_modules_[cubin] = module;
-    }
+    kernel_to_gpu_binary_[kernel] = ptx;
   } else {
     LOG(WARNING) << "no method of loading CUDA kernel provided";
     return false;
   }
-
-  VLOG(2) << "getting function " << kernelname << " from module " << module;
+  VLOG(2) << "getting function " << *kernelname << " from module " << module;
   if (!CUDADriver::GetModuleFunction(context_, module, kernelname->c_str(),
                                      cuda_kernel->cuda_function_ptr())) {
     return false;
@@ -320,11 +300,86 @@ bool CUDAExecutor::GetKernel(const MultiKernelLoaderSpec &spec,
 
   KernelMetadata kernel_metadata;
   if (!GetKernelMetadata(cuda_kernel, &kernel_metadata)) {
-    LOG(WARNING) << "Unable to get metadata for kernel " << kernelname;
+    LOG(WARNING) << "unable to get metadata for kernel " << *kernelname;
   }
   kernel->set_metadata(kernel_metadata);
   kernel->set_name(*kernelname);
   return true;
+}
+
+bool CUDAExecutor::UnloadGpuBinary(const void *gpu_binary) {
+  auto module_it = gpu_binary_to_module_.find(gpu_binary);
+  if (gpu_binary_to_module_.end() == module_it) {
+    VLOG(3) << "No loaded CUDA module for " << gpu_binary;
+    return false;
+  }
+  auto &module = module_it->second.first;
+  auto &refcount = module_it->second.second;
+  VLOG(3) << "Found CUDA module " << module << " with refcount " << refcount;
+  if (--refcount == 0) {
+    VLOG(3) << "Unloading CUDA module " << module;
+    CUDADriver::UnloadModule(context_, module);
+    gpu_binary_to_module_.erase(module_it);
+  }
+  return true;
+}
+
+void CUDAExecutor::UnloadKernel(const KernelBase *kernel) {
+  VLOG(3) << "Unloading kernel " << kernel << " : " << kernel->name();
+
+  mutex_lock lock{in_memory_modules_mu_};
+  auto gpu_binary_it = kernel_to_gpu_binary_.find(kernel);
+  if (kernel_to_gpu_binary_.end() == gpu_binary_it) {
+    VLOG(3) << "Kernel " << kernel << " : " << kernel->name()
+            << " has never been loaded.";
+    return;  // We've never seen this kernel.
+  }
+  VLOG(3) << "Kernel " << kernel << " : " << kernel->name()
+          << " has loaded GPU code " << gpu_binary_it->second;
+  UnloadGpuBinary(gpu_binary_it->second);
+  kernel_to_gpu_binary_.erase(gpu_binary_it);
+}
+
+bool CUDAExecutor::LoadModule(const MultiModuleLoaderSpec &spec,
+                              ModuleHandle *module_handle) {
+  // In CUDAExecutor we store the pointer to the GPU binary (PTX or CUBIN) as
+  // ModuleHandle::id().
+  CUmodule cu_module;
+  if (spec.has_cuda_cubin_in_memory()) {
+    mutex_lock lock{in_memory_modules_mu_};
+    if (!LoadModuleFromCuBin(
+            reinterpret_cast<const char *>(spec.cuda_cubin_in_memory().data()),
+            &cu_module)) {
+      return false;
+    }
+    *module_handle = ModuleHandle(const_cast<void *>(
+        static_cast<const void *>(spec.cuda_cubin_in_memory().data())));
+    return true;
+  } else if (spec.has_cuda_ptx_in_memory()) {
+    if (cc_major_ == 0 && cc_minor_ == 0) {
+      return false;
+    }
+
+    if (!spec.cuda_ptx_in_memory()) {
+      return false;
+    }
+
+    mutex_lock lock{in_memory_modules_mu_};
+    if (!LoadModuleFromPtx(spec.cuda_ptx_in_memory(), &cu_module)) {
+      return false;
+    }
+    *module_handle = ModuleHandle(const_cast<void *>(
+        static_cast<const void *>(spec.cuda_ptx_in_memory())));
+    return true;
+  }
+  LOG(WARNING) << "no method of loading CUDA module provided";
+  return false;
+}
+
+bool CUDAExecutor::UnloadModule(ModuleHandle module_handle) {
+  const char *gpu_binary = reinterpret_cast<const char *>(module_handle.id());
+  mutex_lock lock{in_memory_modules_mu_};
+  return UnloadGpuBinary(gpu_binary);
 }
 
 bool CUDAExecutor::GetKernelMetadata(CUDAKernel *cuda_kernel,
@@ -355,15 +410,18 @@ bool CUDAExecutor::Launch(Stream *stream, const ThreadDim &thread_dims,
   const CUDAKernel *cuda_kernel = AsCUDAKernel(&kernel);
   CUfunction cufunc = cuda_kernel->AsCUDAFunctionValue();
 
-  // Only perform/print the occupancy check 1x.
-  launched_kernels_mu_.lock();
-  if (launched_kernels_.find(cufunc) == launched_kernels_.end()) {
-    OccupancyCheck(kernel, thread_dims, block_dims);
-    // TODO(rspringer): Remove elements from launched_kernels_...if we ever
-    // expose a kernel/module deallocation method.
-    launched_kernels_.insert(cufunc);
+  // Only perform/print the occupancy check once.  Even just checking to see
+  // whether we've done an occupancy check on this kernel before isn't free
+  // (because we have to synchronize), so we only do this at -v 2+.
+  if (VLOG_IS_ON(2)) {
+    mutex_lock lock(launched_kernels_mu_);
+    if (!launched_kernels_.count(cufunc)) {
+      VlogOccupancyInfo(kernel, thread_dims, block_dims);
+      // TODO(rspringer): Remove elements from launched_kernels_...if we ever
+      // expose a kernel/module deallocation method.
+      launched_kernels_.insert(cufunc);
+    }
   }
-  launched_kernels_mu_.unlock();
 
   if (cuda_kernel->GetPreferredCacheConfig() !=
       KernelCacheConfig::kNoPreference) {
@@ -372,14 +430,14 @@ bool CUDAExecutor::Launch(Stream *stream, const ThreadDim &thread_dims,
 
   void **kernel_params = const_cast<void **>(args.argument_addresses().data());
 
-  if (!CUDADriver::LaunchKernel(GetCudaContext(stream), cufunc, block_dims.x,
-                                block_dims.y, block_dims.z, thread_dims.x,
-                                thread_dims.y, thread_dims.z,
-                                args.number_of_shared_bytes(), custream,
-                                kernel_params, nullptr /* = extra */)) {
-    LOG(ERROR) << "failed to launch CUDA kernel with args: "
+  if (!CUDADriver::LaunchKernel(context_, cufunc, block_dims.x, block_dims.y,
+                                block_dims.z, thread_dims.x, thread_dims.y,
+                                thread_dims.z, args.number_of_shared_bytes(),
+                                custream, kernel_params,
+                                nullptr /* = extra */)) {
+    LOG(ERROR) << "failed to launch CUDA kernel " << kernel.name() << " with "
                << args.number_of_arguments()
-               << "; thread dim: " << thread_dims.ToString()
+               << " args; thread dim: " << thread_dims.ToString()
                << "; block dim: " << block_dims.ToString();
     return false;
   }
@@ -390,9 +448,9 @@ bool CUDAExecutor::Launch(Stream *stream, const ThreadDim &thread_dims,
 // This is a non-essential operation; if there's a failure, proceed without
 // logging an error. It's nearly certain that in case of failures, we'd never
 // get here in the first place; these are very low-impact routines.
-void CUDAExecutor::OccupancyCheck(const KernelBase &kernel,
-                                  const ThreadDim &thread_dims,
-                                  const BlockDim &block_dims) {
+void CUDAExecutor::VlogOccupancyInfo(const KernelBase &kernel,
+                                     const ThreadDim &thread_dims,
+                                     const BlockDim &block_dims) {
   VLOG(2) << "Computing kernel occupancy for kernel "
           << kernel.demangled_name();
   VLOG(2) << "Thread dimensions (" << thread_dims.x << ", " << thread_dims.y
@@ -411,40 +469,59 @@ void CUDAExecutor::OccupancyCheck(const KernelBase &kernel,
   const DeviceDescription &device_description =
       kernel.parent()->GetDeviceDescription();
 
-  uint64 blocks_per_sm = CalculateOccupancy(
-      device_description, regs_per_thread, smem_per_block, thread_dims);
+  const CUDAKernel *cuda_kernel = AsCUDAKernel(&kernel);
+  CUfunction cufunc = cuda_kernel->AsCUDAFunctionValue();
+
+  int blocks_per_sm = CalculateOccupancy(device_description, regs_per_thread,
+                                         smem_per_block, thread_dims, cufunc);
   VLOG(2) << "Resident blocks per SM is " << blocks_per_sm;
 
-  // To increase occupancy, there must be a sufficient number of blocks
-  // available to spread across the sm's at this new improved occupancy level.
-  int multiprocessor_count = device_description.core_count();
-  int block_count = block_dims.x * block_dims.y * block_dims.z;
-  int available_blocks_per_sm =
-      port::MathUtil::CeilOfRatio(block_count, multiprocessor_count);
-  if (available_blocks_per_sm <= static_cast<int64>(blocks_per_sm)) {
-    VLOG(2) << "Occupancy is limited by number of blocks available per sm.";
-    return;
+  int suggested_threads =
+      CompareOccupancy(&blocks_per_sm, device_description, regs_per_thread,
+                       smem_per_block, thread_dims, cufunc);
+  if (suggested_threads != 0) {
+    VLOG(2) << "The cuda occupancy calculator recommends using "
+            << suggested_threads
+            << " threads per block to achieve an occupancy of " << blocks_per_sm
+            << " blocks per SM.";
   }
+}
 
-  uint64 improved_regs_per_thread = CalculateRegisterLimitForTargetOccupancy(
-      device_description, smem_per_block, thread_dims, blocks_per_sm + 1);
-  if (improved_regs_per_thread != 0) {
-    VLOG(2) << "Reducing register usage from " << regs_per_thread
-            << " to " << improved_regs_per_thread
-            << " could increase resident blocks per SM by one.";
+// Compute and return maximum blocks per core (occupancy) based on the
+// device description, some kernel characteristics and the number of threads per
+// block.  If unable to compute occupancy, zero is returned.
+int CUDAExecutor::CalculateOccupancy(
+    const DeviceDescription &device_description, uint64 registers_per_thread,
+    uint64 shared_memory_per_block, const ThreadDim &thread_dims,
+    CUfunction func) {
+  int suggested_blocks = 0;
+  int suggested_threads = 0;
+  CUresult err = cuOccupancyMaxPotentialBlockSize(
+      &suggested_blocks, &suggested_threads, func, nullptr,
+      shared_memory_per_block, 0);
+  CHECK_EQ(err, CUDA_SUCCESS);
+  return suggested_blocks;
+}
 
-    uint64 reg_reduction = regs_per_thread - improved_regs_per_thread;
-    if (reg_reduction <=
-        static_cast<uint64>(FLAGS_register_occupancy_warning_threshold)) {
-      LOG(INFO) << "Notice: occupancy would increase if register usage was"
-                << " reduced from " << regs_per_thread
-                << " to " << improved_regs_per_thread
-                << " registers per thread for kernel: "
-                << kernel.demangled_name();
-    }
+// Compute and return the suggested thread count to achieve ideal occupancy.
+// If the provided thread dimensions match this number, zero is returned.
+int CUDAExecutor::CompareOccupancy(int *initial_blocks,
+                                   const DeviceDescription &device_description,
+                                   uint64 registers_per_thread,
+                                   uint64 shared_memory_per_block,
+                                   const ThreadDim &thread_dims,
+                                   CUfunction func) {
+  int suggested_blocks = 0;
+  int suggested_threads = 0;
+  CUresult err = cuOccupancyMaxPotentialBlockSize(
+      &suggested_blocks, &suggested_threads, func, nullptr,
+      shared_memory_per_block, 0);
+  CHECK_EQ(err, CUDA_SUCCESS);
+  if (suggested_blocks > *initial_blocks) {
+    *initial_blocks = suggested_blocks;
+    return suggested_threads;
   } else {
-    VLOG(2) << "Resident blocks per SM cannot be increased by reducing "
-        "register usage.";
+    return 0;
   }
 }
 
@@ -508,20 +585,21 @@ bool CUDAExecutor::SynchronousMemSet(DeviceMemoryBase *location, int value,
                                             value, size);
 }
 
-bool CUDAExecutor::SynchronousMemcpy(DeviceMemoryBase *gpu_dst,
-                                     const void *host_src, uint64 size) {
+port::Status CUDAExecutor::SynchronousMemcpy(DeviceMemoryBase *gpu_dst,
+                                             const void *host_src,
+                                             uint64 size) {
   return CUDADriver::SynchronousMemcpyH2D(context_, AsCudaDevicePtr(gpu_dst),
                                           host_src, size);
 }
 
-bool CUDAExecutor::SynchronousMemcpy(void *host_dst,
-                                     const DeviceMemoryBase &gpu_src,
-                                     uint64 size) {
+port::Status CUDAExecutor::SynchronousMemcpy(void *host_dst,
+                                             const DeviceMemoryBase &gpu_src,
+                                             uint64 size) {
   return CUDADriver::SynchronousMemcpyD2H(context_, host_dst,
                                           AsCudaDevicePtr(gpu_src), size);
 }
 
-bool CUDAExecutor::SynchronousMemcpyDeviceToDevice(
+port::Status CUDAExecutor::SynchronousMemcpyDeviceToDevice(
     DeviceMemoryBase *gpu_dst, const DeviceMemoryBase &gpu_src, uint64 size) {
   return CUDADriver::SynchronousMemcpyD2D(context_, AsCudaDevicePtr(gpu_dst),
                                           AsCudaDevicePtr(gpu_src), size);
@@ -616,10 +694,10 @@ port::Status CUDAExecutor::WaitForEvent(Stream *stream, Event *event) {
                                     AsCUDAEvent(event)->cuda_event())) {
     return port::Status::OK();
   } else {
-    return port::Status{
+    return port::Status(
         port::error::INTERNAL,
         port::Printf("error recording waiting for CUDA event on stream %p",
-                     stream)};
+                     stream));
   }
 }
 
@@ -670,7 +748,7 @@ bool CUDAExecutor::StopTimer(Stream *stream, Timer *timer) {
   return AsCUDATimer(timer)->Stop(AsCUDAStream(stream));
 }
 
-bool CUDAExecutor::BlockHostUntilDone(Stream *stream) {
+port::Status CUDAExecutor::BlockHostUntilDone(Stream *stream) {
   return CUDADriver::SynchronizeStream(context_, AsCUDAStreamValue(stream));
 }
 
@@ -790,25 +868,26 @@ bool CUDAExecutor::DeviceMemoryUsage(int64 *free, int64 *total) const {
   return CUDADriver::GetDeviceMemoryInfo(context_, free, total);
 }
 
-bool CUDAExecutor::GetSymbol(const string& symbol_name, void **mem,
+bool CUDAExecutor::GetSymbol(const string &symbol_name,
+                             ModuleHandle module_handle, void **mem,
                              size_t *bytes) {
-  {  // give limited scope to mutex_lock
-    mutex_lock lock{disk_modules_mu_};
-    for (auto &it : disk_modules_) {
-      if (CUDADriver::GetModuleSymbol(context_, it.second, symbol_name.c_str(),
-                                      reinterpret_cast<CUdeviceptr *>(mem),
-                                      bytes)) {
-        return true;
-      }
-    }
-  }
+  auto lookup_in_module = [&](CUmodule module) {
+    CHECK(module != nullptr);
+    return CUDADriver::GetModuleSymbol(context_, module, symbol_name.c_str(),
+                                       reinterpret_cast<CUdeviceptr *>(mem),
+                                       bytes);
+  };
 
   {  // give limited scope to mutex_lock
     mutex_lock lock{in_memory_modules_mu_};
-    for (auto &it : in_memory_modules_) {
-      if (CUDADriver::GetModuleSymbol(context_, it.second, symbol_name.c_str(),
-                                      reinterpret_cast<CUdeviceptr *>(mem),
-                                      bytes)) {
+    if (static_cast<bool>(module_handle)) {
+      auto it = gpu_binary_to_module_.find(module_handle.id());
+      CHECK(it != gpu_binary_to_module_.end());
+      return lookup_in_module(it->second.first);
+    }
+
+    for (auto &it : gpu_binary_to_module_) {
+      if (lookup_in_module(it.second.first)) {
         return true;
       }
     }
@@ -860,11 +939,11 @@ CUDAExecutor::GetTimerImplementation() {
   return std::unique_ptr<internal::TimerInterface>(new CUDATimer(this));
 }
 
-void *CUDAExecutor::CudaContextHack() { return context_; }
+void *CUDAExecutor::GpuContextHack() { return context_; }
 
 CudaContext* CUDAExecutor::cuda_context() { return context_; }
 
-// Attemps to read the NUMA node corresponding to the GPU device's PCI bus out
+// Attempts to read the NUMA node corresponding to the GPU device's PCI bus out
 // of SysFS. Returns -1 if it cannot.
 //
 // For anything more complicated/prod-focused than this, you'll likely want to
@@ -872,6 +951,12 @@ CudaContext* CUDAExecutor::cuda_context() { return context_; }
 static int TryToReadNumaNode(const string &pci_bus_id, int device_ordinal) {
 #if defined(__APPLE__)
   LOG(INFO) << "OS X does not support NUMA - returning NUMA node zero";
+  return 0;
+#elif defined(PLATFORM_WINDOWS)
+  // Windows support for NUMA is not currently implemented. Return node 0.
+  return 0;
+#elif defined(__aarch64__)
+  LOG(INFO) << "ARM64 does not support NUMA - returning NUMA node zero";
   return 0;
 #else
   VLOG(2) << "trying to read NUMA node for device ordinal: " << device_ordinal;
@@ -890,10 +975,8 @@ static int TryToReadNumaNode(const string &pci_bus_id, int device_ordinal) {
   // could use the file::* utilities).
   FILE *file = fopen(filename.c_str(), "r");
   if (file == nullptr) {
-#if !defined(PLATFORM_WINDOWS)
     LOG(ERROR) << "could not open file to read NUMA node: " << filename
                << "\nYour kernel may have been built without NUMA support.";
-#endif
     return kUnknownNumaNode;
   }
 
@@ -925,31 +1008,6 @@ static int TryToReadNumaNode(const string &pci_bus_id, int device_ordinal) {
 #endif
 }
 
-// Set of compute capability specific device parameters that cannot be
-// queried from the driver API.  These values instead are baked into a
-// lookup table indexed by compute capability version.
-struct UnqueryableDeviceParams {
-  int cc_major;
-  int cc_minor;
-  uint64 blocks_per_core_limit;
-  uint64 registers_per_core_limit;
-  uint64 registers_per_thread_limit;
-  uint64 warp_alloc_granularity;
-  uint64 register_alloc_granularity;
-  uint64 shared_memory_alloc_granularity;
-};
-
-static const UnqueryableDeviceParams kAllUnqueryableDeviceParams[] = {
-  {
-    3, 5,       // compute capability (3.5)
-    16,         // blocks_per_core_limit
-    64 * 1024,  // registers_per_core_limit
-    255,        // registers_per_thread_limit
-    4,          // warp_alloc_granularity
-    256,        // register_alloc_granularity
-    256         // shared_memory_alloc_granularity
-  }
-};
 
 DeviceDescription *CUDAExecutor::PopulateDeviceDescription() const {
   internal::DeviceDescriptionBuilder builder;
@@ -1001,6 +1059,18 @@ DeviceDescription *CUDAExecutor::PopulateDeviceDescription() const {
     builder.set_device_memory_size(device_memory_size);
   }
 
+  port::StatusOr<int> mem_clock_khz = CUDADriver::GetDeviceAttribute(
+      CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, device_ordinal_);
+  port::StatusOr<int> mem_bus_width_bits = CUDADriver::GetDeviceAttribute(
+      CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, device_ordinal_);
+  if (mem_clock_khz.ok() && mem_bus_width_bits.ok()) {
+    // Times 2 because HBM is DDR memory; it gets two data bits per each data
+    // lane.
+    builder.set_memory_bandwidth(2 * int64_t{mem_clock_khz.ValueOrDie()} *
+                                 1000 *
+                                 int64_t{mem_bus_width_bits.ValueOrDie()} / 8);
+  }
+
   {
     BlockDim block_dim_limit;
     FillBlockDimLimit(&block_dim_limit);
@@ -1013,21 +1083,8 @@ DeviceDescription *CUDAExecutor::PopulateDeviceDescription() const {
     builder.set_name(device_name);
   }
 
-  for (size_t i = 0; i < ARRAYSIZE(kAllUnqueryableDeviceParams); i++) {
-    const auto &params = kAllUnqueryableDeviceParams[i];
-    if (params.cc_major == cc_major_ && params.cc_minor == cc_minor_) {
-      builder.set_blocks_per_core_limit(params.blocks_per_core_limit);
-      builder.set_registers_per_core_limit(params.registers_per_core_limit);
-      builder.set_registers_per_thread_limit(params.registers_per_thread_limit);
-      builder.set_warp_alloc_granularity(params.warp_alloc_granularity);
-      builder.set_register_alloc_granularity(params.register_alloc_granularity);
-      builder.set_shared_memory_alloc_granularity(
-          params.shared_memory_alloc_granularity);
-    }
-  }
-
   builder.set_platform_version(
-      port::StrCat("Compute Capability ", cc_major_, ".", cc_minor_));
+      absl::StrCat("Compute Capability ", cc_major_, ".", cc_minor_));
 
   // TODO(leary) should be a way to query this from the driver, but this is
   // unlikely to change for us any time soon.
@@ -1047,6 +1104,10 @@ DeviceDescription *CUDAExecutor::PopulateDeviceDescription() const {
       CUDADriver::GetMaxRegistersPerBlock(device_).ValueOrDie());
   builder.set_threads_per_warp(
       CUDADriver::GetThreadsPerWarp(device_).ValueOrDie());
+  builder.set_registers_per_core_limit(
+      CUDADriver::GetDeviceAttribute(
+          CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, device_)
+          .ValueOrDie());
 
   auto built = builder.Build();
   return built.release();
@@ -1054,30 +1115,14 @@ DeviceDescription *CUDAExecutor::PopulateDeviceDescription() const {
 
 }  // namespace cuda
 
-namespace gpu = ::perftools::gputools;
-
 void initialize_cuda_gpu_executor() {
-  port::StatusOr<void *> status =
-      gpu::internal::CachedDsoLoader::GetLibcudaDsoHandle();
-  if (!status.ok()) {
-    gpu::cuda::Diagnostician::LogDriverVersionInformation();
-    LOG(INFO) << "LD_LIBRARY_PATH: " << getenv("LD_LIBRARY_PATH");
-    LOG(INFO) << "failed to find libcuda.so on this system: "
-              << status.status();
-  }
-
-  // TODO(b/22689637): Temporary until users are migrated off of PlatformKind.
-  gpu::PluginRegistry::Instance()->MapPlatformKindToId(
-      gpu::PlatformKind::kCuda, gpu::cuda::kCudaPlatformId);
-
-  *gpu::internal::MakeCUDAExecutorImplementation() = [](
-      const gpu::PluginConfig &config) {
-    return new gpu::cuda::CUDAExecutor{config};
+  *internal::MakeCUDAExecutorImplementation() = [](const PluginConfig &config) {
+    return new cuda::CUDAExecutor{config};
   };
 }
 
-}  // namespace gputools
-}  // namespace perftools
+}  // namespace stream_executor
 
-REGISTER_MODULE_INITIALIZER(
-    cuda_gpu_executor, {perftools::gputools::initialize_cuda_gpu_executor();});
+REGISTER_MODULE_INITIALIZER(cuda_gpu_executor, {
+  stream_executor::initialize_cuda_gpu_executor();
+});
